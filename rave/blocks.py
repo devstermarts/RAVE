@@ -519,6 +519,7 @@ class EncoderV2(nn.Module):
         recurrent_layer: Optional[Callable[[], nn.Module]] = None,
         spectrogram: Optional[Callable[[], Spectrogram]] = None,
         activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(.2),
+        adain: Optional[Callable[[int], nn.Module]] = None,
     ) -> None:
         super().__init__()
         dilations_list = normalize_dilations(dilations, ratios)
@@ -542,6 +543,8 @@ class EncoderV2(nn.Module):
         for r, dilations in zip(ratios, dilations_list):
             # ADD RESIDUAL DILATED UNITS
             for d in dilations:
+                if adain is not None:
+                    net.append(adain(dim=num_channels))
                 net.append(
                     Residual(
                         DilatedUnit(
@@ -588,7 +591,9 @@ class EncoderV2(nn.Module):
         if self.spectrogram is not None:
             x = self.spectrogram(x[:, 0])[..., :-1]
             x = torch.log1p(x)
-        return self.net(x)
+
+        x = self.net(x)
+        return x
 
 
 class GeneratorV2(nn.Module):
@@ -606,6 +611,7 @@ class GeneratorV2(nn.Module):
         amplitude_modulation: bool = False,
         noise_module: Optional[NoiseGeneratorV2] = None,
         activation: Callable[[int], nn.Module] = lambda dim: nn.LeakyReLU(.2),
+        adain: Optional[Callable[[int], nn.Module]] = None,
     ) -> None:
         super().__init__()
         dilations_list = normalize_dilations(dilations, ratios)[::-1]
@@ -649,6 +655,8 @@ class GeneratorV2(nn.Module):
 
             # ADD RESIDUAL DILATED UNITS
             for d in dilations:
+                if adain is not None:
+                    net.append(adain(num_channels))
                 net.append(
                     Residual(
                         DilatedUnit(
@@ -682,6 +690,7 @@ class GeneratorV2(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.net(x)
+
         noise = 0.
 
         if self.noise_module is not None:
@@ -724,6 +733,7 @@ class VariationalEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor):
         z = self.encoder(x)
+
         if self.warmed_up:
             z = z.detach()
         return z
@@ -840,6 +850,72 @@ class Snake(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + (self.alpha + 1e-9).reciprocal() * (self.alpha *
                                                        x).sin().pow(2)
+
+
+class AdaptiveInstanceNormalization(nn.Module):
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.register_buffer("mean_x", torch.zeros(cc.MAX_BATCH_SIZE, dim, 1))
+        self.register_buffer("std_x", torch.ones(cc.MAX_BATCH_SIZE, dim, 1))
+        self.register_buffer("learn_x", torch.zeros(1))
+        self.register_buffer("num_update_x", torch.zeros(1))
+
+        self.register_buffer("mean_y", torch.zeros(cc.MAX_BATCH_SIZE, dim, 1))
+        self.register_buffer("std_y", torch.ones(cc.MAX_BATCH_SIZE, dim, 1))
+        self.register_buffer("learn_y", torch.zeros(1))
+        self.register_buffer("num_update_y", torch.zeros(1))
+
+    def update(self, target: torch.Tensor, source: torch.Tensor,
+               num_updates: torch.Tensor) -> None:
+        bs = source.shape[0]
+        target[:bs] += (source - target[:bs]) / (num_updates + 1)
+
+    def reset_x(self):
+        self.mean_x.zero_()
+        self.std_x.zero_().add_(1)
+        self.num_update_x.zero_()
+
+    def reset_y(self):
+        self.mean_y.zero_()
+        self.std_y.zero_().add_(1)
+        self.num_update_y.zero_()
+
+    def transfer(self, x: torch.Tensor) -> torch.Tensor:
+        bs = x.shape[0]
+
+        x = (x - self.mean_x[:bs]) / (self.std_x[:bs] + 1e-5)
+        x = x * self.std_y[:bs] + self.mean_y[:bs]
+
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            return x
+
+        if self.learn_y:
+            mean = x.mean(-1, keepdim=True)
+            std = x.std(-1, keepdim=True)
+
+            self.update(self.mean_y, mean, self.num_update_y)
+            self.update(self.std_y, std, self.num_update_y)
+            self.num_update_y += 1
+
+            return x
+
+        else:
+            if self.learn_x:
+                mean = x.mean(-1, keepdim=True)
+                std = x.std(-1, keepdim=True)
+
+                self.update(self.mean_x, mean, self.num_update_x)
+                self.update(self.std_x, std, self.num_update_x)
+                self.num_update_x += 1
+
+            if self.num_update_x and self.num_update_y:
+                x = self.transfer(x)
+
+            return x
 
 
 def leaky_relu(dim: int, alpha: float):

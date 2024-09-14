@@ -1,6 +1,5 @@
-import math
 from time import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional
 
 import gin
 import numpy as np
@@ -12,7 +11,8 @@ from sklearn.decomposition import PCA
 
 import rave.core
 
-from . import blocks
+from .balancer import Balancer
+from .blocks import DiscreteEncoder, VariationalEncoder
 
 
 class Profiler:
@@ -60,41 +60,10 @@ class QuantizeCallback(WarmupCallback):
         if pl_module.warmup_quantize is None: return
 
         if self.state['training_steps'] >= pl_module.warmup_quantize:
-            if isinstance(pl_module.encoder, blocks.DiscreteEncoder):
+            if isinstance(pl_module.encoder, DiscreteEncoder):
                 pl_module.encoder.enabled = torch.tensor(1).type_as(
                     pl_module.encoder.enabled)
         self.state['training_steps'] += 1
-
-
-@gin.configurable
-class BetaWarmupCallback(pl.Callback):
-
-    def __init__(self, initial_value: float, target_value: float,
-                 warmup_len: int) -> None:
-        super().__init__()
-        self.state = {'training_steps': 0}
-        self.warmup_len = warmup_len
-        self.initial_value = initial_value
-        self.target_value = target_value
-
-    def on_train_batch_start(self, trainer, pl_module, batch,
-                             batch_idx) -> None:
-        self.state['training_steps'] += 1
-        if self.state["training_steps"] >= self.warmup_len:
-            pl_module.beta_factor = self.target_value
-            return
-
-        warmup_ratio = self.state["training_steps"] / self.warmup_len
-
-        beta = math.log(self.initial_value) * (1 - warmup_ratio) + math.log(
-            self.target_value) * warmup_ratio
-        pl_module.beta_factor = math.exp(beta)
-
-    def state_dict(self):
-        return self.state.copy()
-
-    def load_state_dict(self, state_dict):
-        self.state.update(state_dict)
 
 
 @gin.configurable
@@ -114,7 +83,7 @@ class RAVE(pl.LightningModule):
         num_skipped_features,
         audio_distance: Callable[[], nn.Module],
         multiband_audio_distance: Callable[[], nn.Module],
-        weights: Dict[str, float],
+        balancer: Callable[[], Balancer],
         warmup_quantize: Optional[int] = None,
         pqmf: Optional[Callable[[], nn.Module]] = None,
         update_discriminator_every: int = 2,
@@ -147,7 +116,7 @@ class RAVE(pl.LightningModule):
         # SCHEDULE
         self.warmup = phase_1_duration
         self.warmup_quantize = warmup_quantize
-        self.weights = weights
+        self.balancer = balancer()
 
         self.warmed_up = False
 
@@ -159,7 +128,6 @@ class RAVE(pl.LightningModule):
         self.update_discriminator_every = update_discriminator_every
 
         self.eval_number = 0
-        self.beta_factor = 1.
         self.integrator = None
 
         self.enable_pqmf_encode = enable_pqmf_encode
@@ -214,7 +182,6 @@ class RAVE(pl.LightningModule):
 
         # DECODE LATENT
         y_multiband = self.decoder(z)
-
         p.tick('decode')
 
         if self.valid_signal_crop and self.receptive_field.sum():
@@ -300,7 +267,7 @@ class RAVE(pl.LightningModule):
         p.tick('update loss gen dict')
 
         if reg.item():
-            loss_gen['regularization'] = reg * self.beta_factor
+            loss_gen['regularization'] = reg
 
         if self.warmed_up:
             loss_gen['feature_matching'] = feature_matching_distance
@@ -315,15 +282,10 @@ class RAVE(pl.LightningModule):
             p.tick('dis opt')
         else:
             gen_opt.zero_grad()
-            loss_gen_value = 0.
-            for k, v in loss_gen.items():
-                loss_gen_value += v * self.weights.get(k, 1.)
-            loss_gen_value.backward()
+            self.balancer.backward(loss_gen, y_multiband, self.log, p.tick)
             gen_opt.step()
 
         # LOGGING
-        self.log("beta_factor", self.beta_factor)
-
         if self.warmed_up:
             self.log("loss_dis", loss_dis)
             self.log("pred_real", pred_real.mean())
@@ -355,17 +317,15 @@ class RAVE(pl.LightningModule):
 
         if self.enable_pqmf_encode:
             z = self.encoder(x_multiband)
-
         else:
             z = self.encoder(x)
 
-        if isinstance(self.encoder, blocks.VariationalEncoder):
+        if isinstance(self.encoder, VariationalEncoder):
             mean = torch.split(z, z.shape[1] // 2, 1)[0]
         else:
             mean = None
 
         z = self.encoder.reparametrize(z)[0]
-
         y = self.decoder(z)
 
         if self.pqmf is not None:
@@ -397,8 +357,7 @@ class RAVE(pl.LightningModule):
         audio = list(map(lambda x: x.cpu(), audio))
 
         # LATENT SPACE ANALYSIS
-        if not self.warmed_up and isinstance(self.encoder,
-                                             blocks.VariationalEncoder):
+        if not self.warmed_up and isinstance(self.encoder, VariationalEncoder):
             z = torch.cat(z, 0)
             z = rearrange(z, "b c t -> (b t) c")
 
